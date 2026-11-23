@@ -1,4 +1,7 @@
+import 'dart:math' as math;
+
 import '../domain/dates.dart';
+import '../domain/period_stats.dart';
 import '../domain/rate_sheet.dart';
 import 'bnm_api.dart';
 import 'bnm_parser.dart';
@@ -36,6 +39,32 @@ class NoRatesException implements Exception {
   String toString() => 'NoRatesException: $message';
 }
 
+/// Daily values of one currency pair for the comparison screens.
+class PairHistory {
+  const PairHistory({
+    required this.from,
+    required this.to,
+    required this.start,
+    required this.end,
+    required this.points,
+    required this.unloadedDays,
+    this.notice,
+  });
+
+  final String from;
+  final String to;
+  final DateTime start;
+  final DateTime end;
+
+  /// One point per day that has published rates, oldest first.
+  final List<RatePoint> points;
+
+  /// Days that could not be loaded (no network and not in the cache).
+  final int unloadedDays;
+
+  final String? notice;
+}
+
 /// Single entry point for rates: BNM first, the local cache as a fallback.
 class RateRepository {
   RateRepository({
@@ -43,6 +72,7 @@ class RateRepository {
     required RateCache cache,
     DateTime Function()? clock,
     this.lookbackDays = 10,
+    this.parallelRequests = 6,
   })  : _source = source,
         _cache = cache,
         _clock = clock ?? DateTime.now;
@@ -53,6 +83,9 @@ class RateRepository {
 
   /// How many days back to look when today has no published rates.
   final int lookbackDays;
+
+  /// Simultaneous requests while loading a month of history.
+  final int parallelRequests;
 
   DateTime get today => dateOnly(_clock());
 
@@ -102,5 +135,81 @@ class RateRepository {
     throw NoRatesException(
       '$problem. Сохранённых курсов пока нет — подключитесь к интернету и обновите.',
     );
+  }
+
+  /// Rates of [from]/[to] for the last [days] calendar days including today.
+  ///
+  /// Days already in the cache are not requested again. Missing days are
+  /// fetched from BNM in small parallel batches. Without network the result
+  /// contains whatever is cached and [PairHistory.unloadedDays] > 0.
+  Future<PairHistory> loadPairHistory({
+    required String from,
+    required String to,
+    required int days,
+  }) async {
+    final end = today;
+    final dates = [for (var back = days - 1; back >= 0; back--) daysBefore(end, back)];
+
+    final known = <DateTime, RateSheet?>{};
+    final toFetch = <DateTime>[];
+    for (final day in dates) {
+      final cached = await _cache.loadDay(day);
+      // Today's "empty" is not final: BNM may still publish later in the day.
+      final reliable = cached != null && !(cached.sheet == null && day == end);
+      if (reliable) {
+        known[day] = cached.sheet;
+      } else {
+        toFetch.add(day);
+      }
+    }
+
+    String? problem;
+    for (var i = 0; i < toFetch.length && problem == null; i += parallelRequests) {
+      final batch = toFetch.sublist(i, math.min(i + parallelRequests, toFetch.length));
+      final results = await Future.wait(batch.map(_fetchDay));
+      for (var j = 0; j < batch.length; j++) {
+        final result = results[j];
+        if (result.error != null) {
+          problem ??= result.error;
+          continue;
+        }
+        known[batch[j]] = result.sheet;
+        if (result.sheet != null || batch[j] != end) {
+          await _cache.saveDay(batch[j], result.sheet);
+        }
+      }
+    }
+
+    final points = <RatePoint>[];
+    for (final day in dates) {
+      final sheet = known[day];
+      if (sheet != null && sheet.contains(from) && sheet.contains(to)) {
+        points.add(RatePoint(day, sheet.crossRate(from, to)));
+      }
+    }
+    final unloaded = dates.where((d) => !known.containsKey(d)).length;
+
+    return PairHistory(
+      from: from,
+      to: to,
+      start: dates.first,
+      end: end,
+      points: points,
+      unloadedDays: unloaded,
+      notice: problem == null
+          ? null
+          : '$problem. Показаны сохранённые данные: не загружено дней — $unloaded из $days.',
+    );
+  }
+
+  Future<({RateSheet? sheet, String? error})> _fetchDay(DateTime day) async {
+    try {
+      final body = await _source.fetchDay(day);
+      return (sheet: BnmParser.parse(body, requestedDate: day), error: null);
+    } on SourceUnavailableException catch (e) {
+      return (sheet: null, error: e.message);
+    } on BnmFormatException catch (e) {
+      return (sheet: null, error: e.message);
+    }
   }
 }
